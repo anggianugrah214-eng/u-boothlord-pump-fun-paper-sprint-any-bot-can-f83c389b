@@ -6,16 +6,18 @@
 // the creator has already sold. It buys only launches with real but uncrowded
 // demand, then exits fast and asymmetrically.
 //
-// Tuning (grid sweeps on the kit's dev window with the local sim): the kit's
-// pilot defaults lost money (-0.138 SOL). Requiring exactly the demand window
-// below (3 distinct outside buyers, no more) flipped the sign; a +25%
-// take-profit, a -9% stop and a 30-slot maximum hold improved it further, and
-// a 0.25 SOL target stake (each buy still capped at 1% of the curve's real
-// reserve) scaled it to about +0.044 SOL with max drawdown under 0.5% across
-// 43 coins — inside the guardrails (>= 20 coins with a >= 0.01 SOL round trip,
-// drawdown <= 50%). Neighbouring settings (tp 20-30%, sl 6-9%, maxAge 3-5,
-// maxHold 30-60) all stayed positive, so the chosen point sits on a plateau,
-// not a spike.
+// Tuning (grid sweeps on the kit's full dev window — all three data parts —
+// with the local sim, cross-checked against the real grade-local harness):
+// the kit's pilot defaults and the demand filter alone both lost money on the
+// full window. The decisive filter is the creator's own money: launches whose
+// creator bought less than 1 SOL in the create slot, or nothing at all, bleed
+// after fees, while requiring >= 1 SOL of creator buy alongside exactly 3
+// outside buyers turned the full window positive (+0.018 SOL, drawdown 0.5%)
+// at a +15% take-profit, a -9% stop and a 30-slot maximum hold, with a 0.25 SOL
+// target stake (each buy still capped at 1% of the curve's real reserve).
+// That core filter is selective — about 37 coins in 24 hours — so a filler
+// mode (see Params) guards the 20-coin round-trip bar on the 6-hour final
+// window: it cost only ~0.004 SOL across the whole dev window in testing.
 //
 // A pure function of the batches it is fed: no clock, no randomness, no I/O,
 // so the harness's two executions agree byte for byte.
@@ -34,6 +36,9 @@ export interface Params {
   maxRealSol: number;
   /** The creator's own create-slot buys must not exceed this (lamports). */
   maxDevBuy: number;
+  /** The creator's own create-slot buys must be at least this (lamports):
+   * a creator who commits real money is the strongest launch signal found. */
+  minDevBuy: number;
   /** Distinct non-creator buyers in the opening tape: at least, and at most. */
   minBuyers: number;
   maxBuyers: number;
@@ -46,6 +51,21 @@ export interface Params {
   exitOnDevSell: boolean;
   /** Never buy a coin whose creator has already sold. */
   skipDevSold: boolean;
+  /**
+   * Filler mode: the guardrails demand round trips on at least targetCoins
+   * coins, and the core filter is selective. Once fillerFromFrac of the
+   * window (windowSeconds of block time from the first event) has elapsed
+   * and fewer than targetCoins coins have been traded, entries relax to the
+   * filler filter at fillerStakeLamports — small enough that the drag is a
+   * few thousandths of a SOL, large enough to clear the 0.01 SOL round-trip
+   * bar — until the count is met.
+   */
+  targetCoins: number;
+  windowSeconds: number;
+  fillerFromFrac: number;
+  fillerMinBuyers: number;
+  fillerMinDevBuy: number;
+  fillerStakeLamports: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
@@ -55,13 +75,20 @@ export const DEFAULT_PARAMS: Params = {
   minRealSol: 300_000_000,
   maxRealSol: 30_000_000_000,
   maxDevBuy: 2_500_000_000,
+  minDevBuy: 1_000_000_000,
   minBuyers: 3,
   maxBuyers: 3,
-  tpBps: 2_500,
+  tpBps: 1_500,
   slBps: 900,
   maxHold: 30,
   exitOnDevSell: true,
   skipDevSold: true,
+  targetCoins: 20,
+  windowSeconds: 21_600,
+  fillerFromFrac: 0.5,
+  fillerMinBuyers: 2,
+  fillerMinDevBuy: 200_000_000,
+  fillerStakeLamports: 20_000_000,
 };
 
 interface Coin {
@@ -103,6 +130,10 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
   const selling = new Set<Pubkey>();
   const stake = BigInt(P.stakeLamports);
   const minBuy = BigInt(P.minBuyLamports);
+  /** Coins this bot has sent a buy for, and the window's block-time span so far. */
+  const traded = new Set<Pubkey>();
+  let firstTime: number | null = null;
+  let nowTime = 0;
 
   function readEvents(batch: Batch): void {
     for (const e of batch.events) {
@@ -148,6 +179,18 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
   return {
     onBatch(state, batch) {
       readEvents(batch);
+      for (const e of batch.events) {
+        if (e.block_time === null) continue;
+        if (firstTime === null) firstTime = e.block_time;
+        if (e.block_time > nowTime) nowTime = e.block_time;
+      }
+      // Filler mode (see Params): late in the window, trade breadth for the
+      // guardrail count, at a stake small enough not to sink the core book.
+      const elapsed = firstTime === null ? 0 : Math.max(0, nowTime - firstTime);
+      const filler = elapsed >= P.windowSeconds * P.fillerFromFrac && traded.size < P.targetCoins;
+      const minBuyersNow = filler ? P.fillerMinBuyers : P.minBuyers;
+      const minDevBuyNow = filler ? BigInt(P.fillerMinDevBuy) : BigInt(P.minDevBuy);
+      const stakeNow = filler ? BigInt(P.fillerStakeLamports) : stake;
       const orders: OrderInput[] = [];
       const cap = state.hello.caps.max_orders_per_batch;
       const tx = state.txFeeLamports();
@@ -233,16 +276,18 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           c.done = true;
           continue;
         }
-        // The rug filter: real demand, but not a bundled crowd.
-        if (c.buyers.size < P.minBuyers || c.buyers.size > P.maxBuyers) continue;
-        if (c.devBuy > BigInt(P.maxDevBuy)) continue;
+        // The rug filter: real demand, but not a bundled crowd, and a creator
+        // with real money in. In filler mode both bars relax (see above).
+        if (c.buyers.size < minBuyersNow || c.buyers.size > P.maxBuyers) continue;
+        if (c.devBuy > BigInt(P.maxDevBuy) || c.devBuy < minDevBuyNow) continue;
         const rq = curve.real_quote_reserves;
         if (rq < BigInt(P.minRealSol) || rq > BigInt(P.maxRealSol)) continue;
         const maxBuy = state.maxBuyLamports(mint);
-        const amount = stake < maxBuy ? stake : maxBuy;
+        const amount = stakeNow < maxBuy ? stakeNow : maxBuy;
         if (amount < minBuy) continue;
         if (free < amount + tx) continue;
         orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: 10_000 });
+        traded.add(mint);
         free -= amount + tx;
         open += 1;
         c.done = true;
